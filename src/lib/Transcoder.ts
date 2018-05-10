@@ -2,6 +2,7 @@ import EventEmitter from 'events'
 import moment from 'moment'
 import ffmpeg from 'fluent-ffmpeg'
 import axios from 'axios'
+import shortid from 'shortid'
 import * as os from 'os'
 import * as path from 'path'
 import { timingSafeEqual } from 'crypto';
@@ -21,6 +22,7 @@ interface ReplayBufferConfig {
   chunkSize: number
   outputPath: string
   prefix: string
+  selectStream: number
 }
 
 class ReplayBuffer extends EventEmitter {
@@ -31,6 +33,7 @@ class ReplayBuffer extends EventEmitter {
   outputPath: string
   outputFile: string
   stream: ffmpeg.FfmpegCommand
+  prefix: string
 
   frames: number = 0
   duration: moment.Duration = moment.duration(0)
@@ -42,28 +45,32 @@ class ReplayBuffer extends EventEmitter {
     bufferSize,
     chunkSize,
     outputPath,
-    prefix
+    prefix,
+    selectStream
   }: ReplayBufferConfig) {
     super()
     this.url = url
-    this.startTime = moment(startTime)
+    this.startTime = moment.utc(startTime)
     this.bufferSize = bufferSize
     this.chunkSize = chunkSize
     this.outputPath = outputPath
     this.outputFile = `${prefix}.m3u8`
+    this.prefix = prefix
 
     const listSize = bufferSize / chunkSize
     const fragmentFilename = `${prefix}-fragment-%d.ts`
 
+    // @todo Figure out how to watch "source" streams
     const stream = this.stream = ffmpeg()
     stream
       .input(this.url)
       .inputOptions([
         '-f hls',
-        '-live_start_index -3'
+        '-live_start_index -3',
+        '-loglevel verbose'
       ])
       .outputOptions([
-        // '-map 0:p:0',
+        `-map 0:p:${selectStream}`,
         '-copyts',
         '-vsync 2',
         `-force_key_frames expr:gte(t\,n_forced*${chunkSize})`,
@@ -88,6 +95,7 @@ class ReplayBuffer extends EventEmitter {
         stdout,
         stderr
       }))
+      // .on('stderr', l => console.log(l))
       .run()
   }
 
@@ -99,7 +107,29 @@ class ReplayBuffer extends EventEmitter {
     this.frames = frames
     this.duration = moment.duration(timemark)
     this.currentTime = this.startTime.clone().add(this.duration)
+    // console.log(this.duration.format('HH:mm:ss.sss'), this.latency)
     this.emit('update', { currentTime: this.currentTime })
+  }
+
+  /**
+   * Returns a promise that resolves if or when the replay buffer contains the
+   * desired timecode.
+   * @todo Probably needs some sort of timeout mechanism that rejects
+   * @param endTime Moment-wrapped timecode to check for containment
+   */
+  contains (endTime: moment.Duration): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const observe = () => {
+        const duration = Number(this.duration)
+        const padding = this.chunkSize * 1000
+        const check = duration > Number(endTime) + padding
+        if (check === true) {
+          this.removeListener('update', observe)
+          resolve()
+        }
+      }
+      this.on('update', observe)
+    })
   }
 
   get latency (): number {
@@ -107,7 +137,7 @@ class ReplayBuffer extends EventEmitter {
   }
 
   get realDuration (): moment.Duration {
-    return moment.duration(moment.utc().diff(this.startTime))
+    return moment.duration(moment.utc().diff(this.startTime), 'ms')
   }
 
   get realTime (): moment.Moment {
@@ -134,45 +164,79 @@ class Transcoder implements TranscoderOptions {
 
   /**
    * Convenience method for returning URLs to Mixer's API.
-   * @param resource An API resource
+   * @param uri An API resource
    * @returns Full URL to an API resource
    */
-  api (resource: string): string {
-    return `https://mixer.com/api/v1/${resource}`
+  api (uri: string): string {
+    const rexp = /^\/?(?:api\/)?(v[^\/]+)?\/?(.+)$/
+    let [, ver, resource ] = uri.match(rexp) || [,,uri]
+    ver = ver || 'v1'
+    return `https://mixer.com/api/${ver}/${resource}`
   }
 
-  // @todo catch/throw errs, .then chain on axios?
+  /**
+   * Parses the contents of a playlist file and returns the collection of
+   * discovered transcoder streams within it.
+   * @param playlist Wall of text containing m3u8 playlist information
+   */
+  parsePlaylist (playlist: string): any[] {
+    const profiles = []
+    const streams = playlist.match(/^#EXT-X-STREAM-INF:.+$/gm) || []
+    for (const stream of streams) {
+      const params = stream.replace(/^#EXT-X-STREAM-INF:/, '').split(',')
+      const profile: any = {}
+      for (const pair of params.map(param => param.split('='))) {
+        const key = pair[0].toLowerCase()
+          .replace(/-([a-z])/g, m => m[1].toUpperCase())
+        profile[key] = pair[1]
+      }
+      profiles.push(profile)
+    }
+    return profiles
+  }
+
   /**
    * Instantiates a `ReplayBuffer` and starts recording a live stream for the
    * provided channel.
    * @todo This needs error handling: offline streams, reconnects, 404s, etc.
-   * @todo Resolve once the transcoder process has actually started
+   * @todo Should probably reject if `quality` is provided but isn't found
    * @param token The name or numeric ID of the Mixer channel to watch
+   * @param quality Desired transcode profile (e.g. "720p"), quietly ignored if
+   *    it isn't found in the stream playlist
    */
-  async watch (token: string): Promise<void> {
+  async watch (token: string, quality?: string): Promise<void> {
     const channelUrl = this.api(`channels/${token}`)
     const { data: channel } = await axios.get(channelUrl)
 
     const manifestUrl = this.api(`channels/${channel.id}/manifest.light2`)
     const { data: manifest } = await axios.get(manifestUrl)
 
-    this.replayBuffer = new ReplayBuffer({
-      url: `https://mixer.com${manifest.hlsSrc}`,
-      startTime: manifest.startedAt,
-      bufferSize: this.bufferSize,
-      chunkSize: this.chunkSize,
-      outputPath: this.outputPath,
-      prefix: channel.token
-    })
+    const playlistUrl = this.api(manifest.hlsSrc)
+    const profiles = await axios.get(playlistUrl)
+      .then(({ data }) => this.parsePlaylist(data))
+    let selectStream = profiles.length - 1
+    if (quality) {
+      for (const profile of profiles) {
+        if (profile.name.toLowerCase().match(quality.toLowerCase())) {
+          selectStream = profiles.indexOf(profile)
+          break
+        }
+      }
+    }
+    // console.log(`Selected stream: ${profiles[selectStream].name}`)
 
-    this.replayBuffer.on('startWatching', cmd => {
-      console.log('start watching', cmd)
-    })
-    this.replayBuffer.on('stopWatching', cmd => {
-      console.log('stop watching', cmd)
-    })
-    this.replayBuffer.on('error', out => {
-      console.log('err', out)
+    return new Promise<void>((res, rej) => {
+      this.replayBuffer = new ReplayBuffer({
+        url: playlistUrl,
+        startTime: manifest.startedAt,
+        bufferSize: this.bufferSize,
+        chunkSize: this.chunkSize,
+        outputPath: this.outputPath,
+        prefix: channel.token,
+        selectStream
+      })
+
+      this.replayBuffer.once('startWatching', () => res())
     })
   }
 
@@ -185,16 +249,19 @@ class Transcoder implements TranscoderOptions {
    */
   async capture (duration: number = 30, predelay: number = 0): Promise<any> {
     if (!this.replayBuffer) {
-      return Promise.reject()
+      return Promise.reject(new Error('Replay buffer has not been started'))
     }
 
-    // @todo Account for latency/"realDuration": the comparison between a
-    // stream's timecode and the duration resolved from the dates reported in
-    // the manifest can't be reliable. Also, FTL vs. "traditional" lag.
-    const offset = this.replayBuffer.duration.clone()
-      .subtract(predelay + duration, 's')
-      .format('HH:mm:ss.sss', { trim: false })
-    const file =`output-${this.replayBuffer.frames}.mp4`
+    const endTime = this.replayBuffer.realDuration.clone()
+      .subtract(predelay, 's')
+    const startTime = endTime.clone()
+      .subtract(duration, 's')
+
+    await this.replayBuffer.contains(endTime)
+
+    const offset = startTime.format('HH:mm:ss.sss', { trim: false })
+
+    const file =`${this.replayBuffer.prefix}-capture-${shortid.generate()}.mp4`
     const outputFile: string = path.join(this.outputPath, file)
     const inputFile = path.join(
       this.replayBuffer.outputPath,
@@ -219,6 +286,7 @@ class Transcoder implements TranscoderOptions {
       // .on('progress', c => console.log('progress', c))
       .on('end', () => resolve(outputFile))
       .on('error', reject)
+      // .on('stderr', l => console.log(l))
       .run()
     })
   }
