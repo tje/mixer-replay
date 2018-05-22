@@ -1,11 +1,12 @@
 import EventEmitter from 'events'
 import moment from 'moment'
-import ffmpeg from 'fluent-ffmpeg'
+import ffmpeg, { FfprobeData, FfmpegCommand } from 'fluent-ffmpeg'
 import axios from 'axios'
 import shortid from 'shortid'
 import * as os from 'os'
 import * as path from 'path'
 import { timingSafeEqual } from 'crypto';
+import { Stream } from 'stream';
 
 require('moment-duration-format')
 
@@ -22,7 +23,13 @@ interface ReplayBufferConfig {
   chunkSize: number
   outputPath: string
   prefix: string
-  selectStream: number
+  selectStream?: number
+}
+
+interface StreamProfile {
+  name: string
+  url: string
+  [prop: string]: any
 }
 
 class ReplayBuffer extends EventEmitter {
@@ -32,7 +39,7 @@ class ReplayBuffer extends EventEmitter {
   chunkSize: number
   outputPath: string
   outputFile: string
-  stream: ffmpeg.FfmpegCommand
+  stream: FfmpegCommand
   prefix: string
 
   frames: number = 0
@@ -60,7 +67,6 @@ class ReplayBuffer extends EventEmitter {
     const listSize = bufferSize / chunkSize
     const fragmentFilename = `${prefix}-fragment-%d.ts`
 
-    // @todo Figure out how to watch "source" streams
     const stream = this.stream = ffmpeg()
     stream
       .input(this.url)
@@ -70,12 +76,12 @@ class ReplayBuffer extends EventEmitter {
         '-loglevel verbose'
       ])
       .outputOptions([
-        `-map 0:p:${selectStream}`,
+        // `-map 0:p:${selectStream}`,
         '-copyts',
         '-vsync 2',
         `-force_key_frames expr:gte(t\,n_forced*${chunkSize})`,
         '-c:v libx264',
-        '-preset ultrafast',
+        // '-preset ultrafast',
         // '-crf 0',
         '-c:a aac',
         '-f hls',
@@ -87,6 +93,7 @@ class ReplayBuffer extends EventEmitter {
       ])
       .output(path.join(this.outputPath, this.outputFile))
 
+      // .on('start', cmd => (console.log(cmd), this.emit('startWatching', cmd)))
       .on('start', cmd => this.emit('startWatching', cmd))
       .on('progress', stat => this.update(stat))
       .on('end', () => this.emit('stopWatching'))
@@ -107,7 +114,7 @@ class ReplayBuffer extends EventEmitter {
     this.frames = frames
     this.duration = moment.duration(timemark)
     this.currentTime = this.startTime.clone().add(this.duration)
-    // console.log(this.duration.format('HH:mm:ss.sss'), this.latency)
+    // console.log(this.duration.format('HH:mm:ss.sss'), this.latency, this.duration.asMilliseconds())
     this.emit('update', { currentTime: this.currentTime })
   }
 
@@ -121,7 +128,8 @@ class ReplayBuffer extends EventEmitter {
     return new Promise((resolve, reject) => {
       const observe = () => {
         const duration = Number(this.duration)
-        const padding = this.chunkSize * 1000
+        // Wait until we get two extra chunks, just to be safe!
+        const padding = this.chunkSize * 1000 * 2
         const check = duration > Number(endTime) + padding
         if (check === true) {
           this.removeListener('update', observe)
@@ -149,17 +157,20 @@ class Transcoder implements TranscoderOptions {
   bufferSize: number
   chunkSize: number
   outputPath: string
+  useManifestTimestamp: boolean
 
   replayBuffer?: ReplayBuffer
 
   constructor ({
     bufferSize = 120,
     chunkSize = 2,
-    outputPath = os.tmpdir()
+    outputPath = os.tmpdir(),
+    useManifestTimestamp = true
   }: any = {}) {
     this.bufferSize = bufferSize
     this.chunkSize = chunkSize
     this.outputPath = outputPath
+    this.useManifestTimestamp = useManifestTimestamp
   }
 
   /**
@@ -179,20 +190,82 @@ class Transcoder implements TranscoderOptions {
    * discovered transcoder streams within it.
    * @param playlist Wall of text containing m3u8 playlist information
    */
-  parsePlaylist (playlist: string): any[] {
+  parsePlaylist (playlist: string): StreamProfile[] {
     const profiles = []
     const streams = playlist.match(/^#EXT-X-STREAM-INF:.+$/gm) || []
     for (const stream of streams) {
       const params = stream.replace(/^#EXT-X-STREAM-INF:/, '').split(',')
-      const profile: any = {}
+      // @todo Do something less bad here
+      const profile: StreamProfile = {
+        name: 'Unknown',
+        url: ''
+      }
       for (const pair of params.map(param => param.split('='))) {
         const key = pair[0].toLowerCase()
           .replace(/-([a-z])/g, m => m[1].toUpperCase())
         profile[key] = pair[1]
       }
+      const descIdx = playlist.indexOf(stream) + stream.length + 1
+      profile.url = playlist.substr(descIdx).split('\n')[0]
       profiles.push(profile)
     }
     return profiles
+  }
+
+  /**
+   * Inspects a given video file, returning the resulting statistics wrapped in
+   * a Promise/
+   * @param file Path to the file or URL to analyze
+   */
+  getVideoStats (file: string): Promise<FfprobeData> {
+    return new Promise((res, rej) => {
+      ffmpeg(file).ffprobe((err, stats) => {
+        if (err) {
+          return rej(err)
+        }
+
+        res(stats)
+      })
+    })
+  }
+
+  /**
+   * Estimates a stream's start time based on a transcode profile (extracted
+   * from manifest). Assumes that the target stream contains exactly 5 "chunks"
+   * in its playlist, based on personal observation.
+   * @see parsePlaylist For transcode profiles
+   * @param profile A transcode profile to estimate start time for
+   */
+  async calcStartTimeFromProfile (profile: StreamProfile): Promise<string> {
+    const { url } = profile
+    const stats = await this.getVideoStats(url)
+    const streamTime = stats.streams[0].start_time
+
+    const segmentDuration = await axios.get(url)
+      .then(({ data }) => (data.match(/EXT-X-TARGETDURATION:(\d+)/) || [])[1])
+      .then(parseFloat)
+
+    return moment.utc()
+      .subtract(streamTime * 1000)
+      .subtract(4 * segmentDuration, 's')
+      .format()
+  }
+
+  /**
+   * Iterates over a list of transcode profiles and returns the first item in
+   * the collection with a positive match or `undefined` otherwise.
+   * @param name The (partial) name of the transcode profile to search for
+   * @param profiles The list of transcode profiles to sift through
+   */
+  queryProfiles (
+    name: string,
+    profiles: StreamProfile[]
+  ): StreamProfile | undefined {
+    for (const profile of profiles) {
+      if (profile.name.toLowerCase().match(name.toLowerCase())) {
+        return profile
+      }
+    }
   }
 
   /**
@@ -204,36 +277,43 @@ class Transcoder implements TranscoderOptions {
    * @param quality Desired transcode profile (e.g. "720p"), quietly ignored if
    *    it isn't found in the stream playlist
    */
-  async watch (token: string, quality?: string): Promise<void> {
+  async watch (token: string, quality: string = 'source'): Promise<void> {
     const channelUrl = this.api(`channels/${token}`)
     const { data: channel } = await axios.get(channelUrl)
 
     const manifestUrl = this.api(`channels/${channel.id}/manifest.light2`)
     const { data: manifest } = await axios.get(manifestUrl)
 
-    const playlistUrl = this.api(manifest.hlsSrc)
+    let startTime = manifest.startedAt
+
+    let playlistUrl = this.api(manifest.hlsSrc)
     const profiles = await axios.get(playlistUrl)
       .then(({ data }) => this.parsePlaylist(data))
-    let selectStream = profiles.length - 1
-    if (quality) {
-      for (const profile of profiles) {
-        if (profile.name.toLowerCase().match(quality.toLowerCase())) {
-          selectStream = profiles.indexOf(profile)
-          break
-        }
+
+    const profile = this.queryProfiles(quality, profiles)
+    if (!profile) {
+      const validQualitiesStr = profiles.map(p => `"${p.name}"`).join(', ')
+      throw new Error(
+        `Unknown quality "${quality}", valid options are: ${validQualitiesStr}`
+      )
+    }
+    if (profile) {
+      playlistUrl = profile.url
+      if (this.useManifestTimestamp === false) {
+        startTime = await this.calcStartTimeFromProfile(profile)
       }
     }
+
     // console.log(`Selected stream: ${profiles[selectStream].name}`)
 
     return new Promise<void>((res, rej) => {
       this.replayBuffer = new ReplayBuffer({
         url: playlistUrl,
-        startTime: manifest.startedAt,
+        startTime,
         bufferSize: this.bufferSize,
         chunkSize: this.chunkSize,
         outputPath: this.outputPath,
-        prefix: channel.token,
-        selectStream
+        prefix: channel.token
       })
 
       this.replayBuffer.once('startWatching', () => res())
