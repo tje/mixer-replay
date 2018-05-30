@@ -1,16 +1,24 @@
 {
   "name": "mixer-replay",
-  "version": "1.0.0",
-  "description": "",
-  "main": "app.js",
+  "version": "0.1.0",
+  "description": "Capture highlights from live video streams on Mixer",
+  "main": "dist/index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "mixer",
+    "beam",
+    "capture",
+    "highlight",
+    "clip"
+  ],
+  "repository": "github:tje/mixer-replay",
+  "author": "tje",
   "license": "ISC",
   "devDependencies": {
     "@types/fluent-ffmpeg": "^2.1.6",
+    "@types/moment-duration-format": "^2.2.0",
     "@types/node": "^10.0.4",
     "@types/shortid": "0.0.29"
   },
